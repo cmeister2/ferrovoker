@@ -127,3 +127,39 @@ jobs:
             target/release/libferrovoker.so
             include/ferrovoker.h
           if-no-files-found: error
+
+  success:
+    name: Success
+    if: ${{ always() }}
+    needs: [rust, msrv, coverage, release-tooling, c-abi, release]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify required jobs succeeded
+        env:
+          RUST_RESULT: ${{ needs.rust.result }}
+          MSRV_RESULT: ${{ needs.msrv.result }}
+          COVERAGE_RESULT: ${{ needs.coverage.result }}
+          RELEASE_TOOLING_RESULT: ${{ needs.release-tooling.result }}
+          C_ABI_RESULT: ${{ needs.c-abi.result }}
+          RELEASE_RESULT: ${{ needs.release.result }}
+        run: |
+          for result in \
+            "$RUST_RESULT" \
+            "$MSRV_RESULT" \
+            "$COVERAGE_RESULT" \
+            "$RELEASE_TOOLING_RESULT" \
+            "$C_ABI_RESULT"
+          do
+            if [ "$result" != success ]; then
+              echo "A required CI job finished with result: $result" >&2
+              exit 1
+            fi
+          done
+
+          case "$RELEASE_RESULT" in
+            success|skipped) ;;
+            *)
+              echo "The release job finished with result: $RELEASE_RESULT" >&2
+              exit 1
+              ;;
+          esac
