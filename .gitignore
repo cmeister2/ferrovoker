@@ -1,0 +1,12 @@
+/target/
+/node_modules/
+/coverage/
+/lcov.info
+*.profraw
+*.profdata
+*.tmp
+*.swp
+.DS_Store
+.env
+.env.*
+!.env.example
