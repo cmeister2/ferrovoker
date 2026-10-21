@@ -5,11 +5,9 @@ for the main async Reqwest integration.
 
 ## Certificate checks
 
-While the first release is unpublished, reference your local checkout:
-
 ```toml
 [dependencies]
-ferrovoker = { path = "../ferrovoker", features = ["rustls"] }
+ferrovoker = { version = "1", features = ["rustls"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 

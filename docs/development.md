@@ -29,10 +29,8 @@ HTTP servers; ordinary tests do not depend on the public feed services.
 ## Releases
 
 The repository is configured as `cmeister2/ferrovoker`; update Cargo metadata if
-hosting it elsewhere. The crate is not published by the local setup process.
-Before enabling publication, create the GitHub repository and set its
-`CARGO_REGISTRY_TOKEN` Actions secret to a crates.io token authorized to publish
-`ferrovoker`.
+hosting it elsewhere. Publication requires the `CARGO_REGISTRY_TOKEN` Actions
+secret to contain a crates.io token authorized to publish `ferrovoker`.
 
 Pushes to `main` or `master` release through semantic-release after checks pass.
 Tags are plain SemVer, such as `1.2.3`. The explicit plugin list creates GitHub

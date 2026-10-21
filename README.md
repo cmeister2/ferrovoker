@@ -1,16 +1,18 @@
 # ferrovoker
 
+[![crates.io](https://img.shields.io/crates/v/ferrovoker.svg)](https://crates.io/crates/ferrovoker)
+[![docs.rs](https://docs.rs/ferrovoker/badge.svg)](https://docs.rs/ferrovoker)
+[![CI](https://github.com/cmeister2/ferrovoker/actions/workflows/ci.yml/badge.svg)](https://github.com/cmeister2/ferrovoker/actions/workflows/ci.yml)
+
 A Rust library that checks certificates against Mozilla OneCRL and Chrome CRLSets.
 It downloads and caches both feeds, refreshes them in the background, and
-deduplicates matching certificates. Async Rust, Rustls, and a C shared library are supported.
+deduplicates matching certificates. Async Rust, rustls, and a C shared library are supported.
 
 ## Make an HTTPS request
 
-Until the first release is published, use a local checkout:
-
 ```toml
 [dependencies]
-ferrovoker = { path = "../ferrovoker", features = ["rustls"] }
+ferrovoker = { version = "1", features = ["rustls"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "aws_lc_rs", "tls12"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
@@ -38,6 +40,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 Normal TLS verification runs before the revocation checks. The feeds have partial
 coverage: an absent certificate is not proof that it is unrevoked. Chrome's CRX3
 publisher signature is verified; Mozilla OneCRL content signatures remain unverified.
+
+## C shared library
+
+On Linux, `cargo build --release --features ffi` produces
+`target/release/libferrovoker.so`. Its managed handle downloads, caches, and
+refreshes both feeds. See the [C guide](docs/c-api.md),
+[header](include/ferrovoker.h), and [example](examples/c/check_chain.c).
 
 ## Documentation
 
