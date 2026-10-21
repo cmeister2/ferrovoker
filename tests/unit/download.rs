@@ -44,9 +44,10 @@ fn downloader() -> Downloader {
             .build()
             .unwrap(),
     )
+    .unwrap()
 }
 
-/// Supplies a small valid complete OneCRL changeset.
+/// Supplies a complete but unsigned OneCRL changeset.
 fn onecrl() -> &'static [u8] {
     br#"{"metadata":{},"timestamp":1,"changes":[]}"#
 }
@@ -59,11 +60,14 @@ fn metadata(attributes: &str) -> Vec<u8> {
     .into_bytes()
 }
 
-/// Valid changeset responses pass through the HTTP layer and parser.
+/// A parsed changeset is rejected unless Mozilla authenticated it.
 #[test]
-fn downloads_onecrl_changeset() {
+fn rejects_unsigned_onecrl_changeset() {
     let (url, handle) = server(response("200 OK", "", onecrl()));
-    assert!(downloader().fetch_onecrl_from(&url).is_ok());
+    assert!(matches!(
+        downloader().fetch_onecrl_from(&url),
+        Err(Error::InvalidOneCrlSignature)
+    ));
     handle.join().unwrap();
 }
 
@@ -100,17 +104,66 @@ fn rejects_actual_body_size() {
     handle.join().unwrap();
 }
 
-/// Backoff on a successful response blocks a later request locally.
+/// Backoff on a transported response survives publisher verification failure.
 #[test]
-fn retains_backoff_after_success() {
+fn retains_backoff_after_unsigned_response() {
     let (url, handle) = server(response("200 OK", "Backoff: 600\r\n", onecrl()));
     let downloader = downloader();
-    assert!(downloader.fetch_onecrl_from(&url).is_ok());
+    assert!(matches!(
+        downloader.fetch_onecrl_from(&url),
+        Err(Error::InvalidOneCrlSignature)
+    ));
     handle.join().unwrap();
     assert!(matches!(
         downloader.fetch_onecrl_from(&url),
         Err(Error::Backoff(1..=600))
     ));
+}
+
+/// Certificate-chain locations must remain on Mozilla's production HTTPS origin.
+#[test]
+fn validates_onecrl_signature_chain_url() {
+    let url = signature_chain_url(&format!("https://{ONECRL_CHAIN_HOST}/onecrl.chain")).unwrap();
+    assert_eq!(url.host_str(), Some(ONECRL_CHAIN_HOST));
+
+    for invalid in [
+        "http://example.com/onecrl.chain",
+        "https://user@content-signature-2.cdn.mozilla.net/onecrl.chain",
+        "https://user:password@content-signature-2.cdn.mozilla.net/onecrl.chain",
+        "https://content-signature-2.cdn.mozilla.net:8443/onecrl.chain",
+        "https://127.0.0.1/onecrl.chain",
+        "https://example.com/onecrl.chain",
+        "not a URL",
+    ] {
+        assert!(matches!(
+            signature_chain_url(invalid),
+            Err(Error::InvalidFormat(_))
+        ));
+    }
+}
+
+/// Certificate chains use their own one-megabyte transport bound.
+#[test]
+fn rejects_declared_certificate_chain_size() {
+    let declared = MAX_CERTIFICATE_CHAIN_BYTES + 1;
+    let (url, handle) = server(response(
+        "200 OK",
+        &format!("Content-Length: {declared}\r\n"),
+        b"",
+    ));
+    let downloader = downloader();
+    assert!(matches!(
+        downloader.download_with_backoff(
+            &downloader.client,
+            &url,
+            false,
+            None,
+            false,
+            MAX_CERTIFICATE_CHAIN_BYTES as u64,
+        ),
+        Err(Error::SizeLimit(limit)) if limit == MAX_CERTIFICATE_CHAIN_BYTES as u64
+    ));
+    handle.join().unwrap();
 }
 
 /// Server backoff is retained even when HTTP status validation fails.

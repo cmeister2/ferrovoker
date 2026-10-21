@@ -45,24 +45,23 @@ fn downloader() -> AsyncDownloader {
             .build()
             .expect("test HTTP client"),
     )
+    .expect("isolated certificate-chain client")
 }
 
-/// Supplies a small complete OneCRL snapshot.
+/// Supplies a complete but unsigned OneCRL snapshot.
 fn onecrl() -> &'static [u8] {
     br#"{"metadata":{},"timestamp":1,"changes":[]}"#
 }
 
 #[tokio::test]
-/// Async client creation and valid snapshot requests work inside Tokio.
-async fn downloads_onecrl_without_blocking_client() {
+/// Async requests enforce publisher authentication inside Tokio.
+async fn rejects_unsigned_onecrl_without_blocking_client() {
     let _production = AsyncDownloader::new().expect("async client inside runtime");
     let (url, handle) = server(response("200 OK", "", onecrl()));
-    let snapshot = downloader()
-        .fetch_onecrl_from(&url)
-        .await
-        .expect("valid snapshot");
-    assert_eq!(snapshot.timestamp, 1);
-    assert!(snapshot.changes.is_empty());
+    assert!(matches!(
+        downloader().fetch_onecrl_from(&url).await,
+        Err(Error::InvalidOneCrlSignature)
+    ));
     handle.join().expect("server completed");
 }
 
@@ -100,6 +99,32 @@ async fn rejects_actual_body_size() {
 }
 
 #[tokio::test]
+/// Certificate chains use their own one-megabyte transport bound.
+async fn rejects_declared_certificate_chain_size() {
+    let declared = MAX_CERTIFICATE_CHAIN_BYTES + 1;
+    let (url, handle) = server(response(
+        "200 OK",
+        &format!("Content-Length: {declared}\r\n"),
+        b"",
+    ));
+    let downloader = downloader();
+    assert!(matches!(
+        downloader
+            .download_with_backoff(
+                &downloader.client,
+                &url,
+                false,
+                None,
+                false,
+                MAX_CERTIFICATE_CHAIN_BYTES as u64,
+            )
+            .await,
+        Err(Error::SizeLimit(limit)) if limit == MAX_CERTIFICATE_CHAIN_BYTES as u64
+    ));
+    handle.join().expect("server completed");
+}
+
+#[tokio::test]
 /// Chunked transfer encoding cannot bypass the response-size limit.
 async fn rejects_chunked_body_size() {
     let (url, handle) = server(response(
@@ -115,13 +140,16 @@ async fn rejects_chunked_body_size() {
 }
 
 #[tokio::test]
-/// Valid chunked bodies are decoded before OneCRL parsing.
-async fn downloads_chunked_body() {
+/// Valid chunked bodies are decoded before publisher authentication.
+async fn rejects_unsigned_decoded_chunked_body() {
     let mut body = format!("{:x}\r\n", onecrl().len()).into_bytes();
     body.extend_from_slice(onecrl());
     body.extend_from_slice(b"\r\n0\r\n\r\n");
     let (url, handle) = server(response("200 OK", "Transfer-Encoding: chunked\r\n", &body));
-    assert!(downloader().fetch_onecrl_from(&url).await.is_ok());
+    assert!(matches!(
+        downloader().fetch_onecrl_from(&url).await,
+        Err(Error::InvalidOneCrlSignature)
+    ));
     handle.join().expect("server completed");
 }
 
@@ -137,14 +165,14 @@ async fn rejects_truncated_response_body() {
 }
 
 #[tokio::test]
-/// Backoff applies to later requests after successful and failed responses.
-async fn retains_backoff_after_success_and_error() {
+/// Backoff applies after transported and HTTP-error responses.
+async fn retains_backoff_after_response_and_error() {
     for status in ["200 OK", "429 Too Many Requests"] {
         let (url, handle) = server(response(status, "Backoff: 600\r\n", onecrl()));
         let downloader = downloader();
         let result = downloader.fetch_onecrl_from(&url).await;
         if status == "200 OK" {
-            assert!(result.is_ok());
+            assert!(matches!(result, Err(Error::InvalidOneCrlSignature)));
         } else {
             assert!(matches!(result, Err(Error::Http(_))));
         }

@@ -12,7 +12,7 @@ deduplicates matching certificates. Async Rust, rustls, and a C shared library a
 
 ```toml
 [dependencies]
-ferrovoker = { version = "1", features = ["rustls"] }
+ferrovoker = { version = "2", features = ["rustls"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "aws_lc_rs", "tls12"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
@@ -38,8 +38,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 Normal TLS verification runs before the revocation checks. The feeds have partial
-coverage: an absent certificate is not proof that it is unrevoked. Chrome's CRX3
-publisher signature is verified; Mozilla OneCRL content signatures remain unverified.
+coverage: an absent certificate is not proof that it is unrevoked. Downloads
+authenticate Chrome's signed CRX3 and Mozilla's signed OneCRL changeset against
+their pinned production publisher identities.
 
 ## C shared library
 

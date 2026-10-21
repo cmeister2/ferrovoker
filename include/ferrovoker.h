@@ -52,8 +52,9 @@ enum FerrovokerReason {
  * 24 hours. Checks use in-memory data and fail if the snapshot becomes too old.
  * Returns 0 on success, -1 on cache, download, integrity, or parsing errors.
  * Errors set *out to NULL. Chrome CRX3 signatures are verified against the pinned
- * CRLSet publisher key, including when loading cached data. Mozilla OneCRL
- * content signatures are not verified. */
+ * CRLSet publisher key. Mozilla OneCRL content signatures are verified against
+ * the pinned production signing root and OneCRL leaf identity. Both checks are
+ * repeated when loading cached data. */
 int32_t ferrovoker_new(Ferrovoker **out);
 
 /* Check chain_len certificates in DER, PEM, or base64 DER format. Formats may

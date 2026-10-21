@@ -13,19 +13,24 @@ use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
 
+use crate::onecrl_signature::{
+    AuthenticatedOneCrl, MAX_CERTIFICATE_CHAIN_BYTES, OneCrlTrust, PRODUCTION_TRUST,
+};
 use crate::{
     AsyncDownloader, CertificateRevocations, CrlSet, Error, IssuerIdentity, OneCrl, Result,
     RevocationProvider, RevocationSet, RevocationStatus,
 };
 
 /// Version of the complete two-feed cache envelope.
-const CACHE_VERSION: u32 = 2;
+const CACHE_VERSION: u32 = 3;
 /// Filename replaced atomically after a successful complete refresh.
-const CACHE_FILENAME: &str = "snapshots-v2.json";
+const CACHE_FILENAME: &str = "snapshots-v3.json";
 /// Bound accommodating two 64 MiB feeds, CRLSet base64 expansion, and JSON metadata.
 const MAX_CACHE_BYTES: u64 = 192 * 1024 * 1024;
 /// Maximum decoded CRLSet size, matching the default download bound.
 const MAX_CRLSET_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum original signed OneCRL changeset size, matching the download bound.
+const MAX_ONECRL_BYTES: usize = 64 * 1024 * 1024;
 /// Maximum original signed CRX size, independent of its decompressed payload.
 const MAX_CRX_BYTES: usize = 64 * 1024 * 1024;
 /// Default interval between attempts to refresh a shared snapshot.
@@ -34,7 +39,8 @@ const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const DEFAULT_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Future resolving to both complete feed snapshots from a single refresh.
-type FeedFuture<'a> = Pin<Box<dyn Future<Output = Result<(OneCrl, CrlSet)>> + Send + 'a>>;
+type FeedFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(AuthenticatedOneCrl, CrlSet)>> + Send + 'a>>;
 
 /// Internal feed source, replaceable in tests without public network requests.
 trait FeedLoader: Send + Sync {
@@ -53,7 +59,7 @@ struct HttpLoader {
 impl FeedLoader for HttpLoader {
     fn fetch(&self) -> FeedFuture<'_> {
         Box::pin(async {
-            let onecrl = self.onecrl.fetch_onecrl().await?;
+            let onecrl = self.onecrl.fetch_authenticated_onecrl().await?;
             let crlset = self.crlset.fetch_crlset().await?;
             Ok((onecrl, crlset))
         })
@@ -65,8 +71,8 @@ impl FeedLoader for HttpLoader {
 /// The default uses the operating system's per-user cache directory, refreshes
 /// every six hours, and rejects snapshots older than 24 hours. Loading requires
 /// a Tokio runtime with time and I/O enabled. Chrome CRX publisher signatures
-/// are verified when downloading or loading cached data; Mozilla OneCRL content
-/// signatures are not verified.
+/// and Mozilla OneCRL content signatures are verified when downloading and
+/// whenever cached data is loaded.
 #[derive(Clone, Debug)]
 pub struct CacheConfig {
     /// Platform-derived or caller-selected directory for the complete cache file.
@@ -77,6 +83,8 @@ pub struct CacheConfig {
     max_age: Duration,
     /// Pinned Chrome publisher key; private to prevent caller-selected trust.
     publisher_key_hash: [u8; 32],
+    /// Pinned Mozilla root and leaf identity; private to prevent caller-selected trust.
+    onecrl_trust: OneCrlTrust,
 }
 
 impl Default for CacheConfig {
@@ -87,6 +95,7 @@ impl Default for CacheConfig {
             refresh_interval: DEFAULT_REFRESH_INTERVAL,
             max_age: DEFAULT_MAX_AGE,
             publisher_key_hash: crate::crx::CRLSET_PUBLISHER_KEY_HASH,
+            onecrl_trust: PRODUCTION_TRUST,
         }
     }
 }
@@ -124,9 +133,10 @@ impl CacheConfig {
     /// Fresh, valid cached snapshots are used without network requests. Missing,
     /// corrupt, expired, stale, future-dated, or unsupported cache files trigger
     /// a complete download. Both feeds must succeed before an index is exposed.
-    /// Cached Chrome CRX signatures are reverified before use. Legacy caches
-    /// containing only unpacked CRLSet bytes are ignored. Disk reads, signature
-    /// verification, and atomic writes run on Tokio's blocking worker pool.
+    /// Cached Chrome CRX and Mozilla content signatures are reverified before
+    /// use. Legacy caches without either feed's publisher evidence are ignored.
+    /// Disk reads, signature verification, and atomic writes run on Tokio's
+    /// blocking worker pool.
     ///
     /// Keep the returned handle, directly or inside a TLS verifier, alive while
     /// making requests. Dropping its last reference stops background refresh.
@@ -184,15 +194,24 @@ impl CacheConfig {
         let cache_file = cache_dir.join(CACHE_FILENAME);
         let max_age = self.max_age;
         let publisher_key_hash = self.publisher_key_hash;
+        let onecrl_trust = self.onecrl_trust;
         let read_file = cache_file.clone();
         let cached = tokio::task::spawn_blocking(move || {
-            read_cache(&read_file, max_age, &publisher_key_hash)
+            read_cache(&read_file, max_age, &publisher_key_hash, onecrl_trust)
         })
         .await
         .map_err(|_| Error::InvalidFormat("cache read task failed"))?;
         let state = match cached {
             Ok(state) => state,
-            Err(_) => fetch_and_persist(source.as_ref(), &cache_dir, publisher_key_hash).await?,
+            Err(_) => {
+                fetch_and_persist(
+                    source.as_ref(),
+                    &cache_dir,
+                    publisher_key_hash,
+                    onecrl_trust,
+                )
+                .await?
+            }
         };
         let delay = initial_refresh_delay(state.fetched_at, self.refresh_interval)?;
         let revocations = Arc::new(Revocations {
@@ -208,6 +227,7 @@ impl CacheConfig {
             self.refresh_interval,
             delay,
             publisher_key_hash,
+            onecrl_trust,
         ));
         *revocations.task_guard() = Some(task);
         Ok(revocations)
@@ -392,8 +412,10 @@ struct CacheEnvelope {
     version: u32,
     /// Local Unix time of the complete successful download.
     fetched_at: u64,
-    /// Complete original OneCRL records and publisher metadata.
-    onecrl: OneCrl,
+    /// Base64-encoded original changeset containing canonical signed values.
+    onecrl_response: String,
+    /// Base64-encoded PEM chain selected during Mozilla signing-key rotation.
+    onecrl_certificate_chain: String,
     /// Base64-encoded original CRX, retaining publisher signatures for verification.
     crlset_crx: String,
 }
@@ -479,6 +501,7 @@ fn read_cache(
     path: &Path,
     max_age: Duration,
     publisher_key_hash: &[u8; 32],
+    onecrl_trust: OneCrlTrust,
 ) -> Result<Arc<SnapshotState>> {
     let file = std::fs::File::open(path)?;
     if file.metadata()?.len() > MAX_CACHE_BYTES {
@@ -495,6 +518,22 @@ fn read_cache(
     }
     let now = unix_now()?.as_secs();
     ensure_fresh(envelope.fetched_at, now, max_age)?;
+    let onecrl_response = decode_cache_field(
+        &envelope.onecrl_response,
+        MAX_ONECRL_BYTES,
+        "invalid OneCRL response base64 in cache",
+    )?;
+    let onecrl_certificate_chain = decode_cache_field(
+        &envelope.onecrl_certificate_chain,
+        MAX_CERTIFICATE_CHAIN_BYTES,
+        "invalid OneCRL certificate-chain base64 in cache",
+    )?;
+    let onecrl = AuthenticatedOneCrl::from_saved(
+        onecrl_response,
+        onecrl_certificate_chain,
+        onecrl_trust,
+        now,
+    )?;
     if envelope.crlset_crx.len() > MAX_CRX_BYTES.div_ceil(3) * 4 {
         return Err(Error::SizeLimit(MAX_CRX_BYTES as u64));
     }
@@ -506,7 +545,7 @@ fn read_cache(
     }
     let crlset =
         CrlSet::from_signed_crx_with_key(bytes, MAX_CRLSET_BYTES as u64, publisher_key_hash)?;
-    let state = index_pair(&envelope.onecrl, &crlset, envelope.fetched_at)?;
+    let state = index_pair(&onecrl.snapshot, &crlset, envelope.fetched_at)?;
     // Expiration is evaluated at load time, rather than only at the cached fetch time.
     if crlset
         .header
@@ -518,6 +557,25 @@ fn read_cache(
         return Err(Error::ExpiredCrlSet);
     }
     Ok(state)
+}
+
+/// Decode one bounded base64 field without permitting encoded-size amplification.
+///
+/// # Errors
+///
+/// Returns a size error for an excessive encoded or decoded value, and an
+/// invalid-format error for malformed base64.
+fn decode_cache_field(encoded: &str, maximum: usize, malformed: &'static str) -> Result<Vec<u8>> {
+    if encoded.len() > maximum.div_ceil(3) * 4 {
+        return Err(Error::SizeLimit(maximum as u64));
+    }
+    let decoded = STANDARD
+        .decode(encoded)
+        .map_err(|_| Error::InvalidFormat(malformed))?;
+    if decoded.len() > maximum {
+        return Err(Error::SizeLimit(maximum as u64));
+    }
+    Ok(decoded)
 }
 
 /// Persist one complete pair through a same-directory atomic rename and file sync.
@@ -552,6 +610,7 @@ async fn fetch_and_persist(
     source: &dyn FeedLoader,
     directory: &Path,
     publisher_key_hash: [u8; 32],
+    onecrl_trust: OneCrlTrust,
 ) -> Result<Arc<SnapshotState>> {
     let (onecrl, crlset) = source.fetch().await?;
     let fetched_at = unix_now()?.as_secs();
@@ -569,11 +628,25 @@ async fn fetch_and_persist(
             MAX_CRLSET_BYTES as u64,
             &publisher_key_hash,
         )?;
-        let state = index_pair(&onecrl, &crlset, fetched_at)?;
+        if onecrl.response.len() > MAX_ONECRL_BYTES {
+            return Err(Error::SizeLimit(MAX_ONECRL_BYTES as u64));
+        }
+        if onecrl.certificate_chain.len() > MAX_CERTIFICATE_CHAIN_BYTES {
+            return Err(Error::SizeLimit(MAX_CERTIFICATE_CHAIN_BYTES as u64));
+        }
+        // Reconstruct from authenticated bytes, ignoring mutable public snapshot fields.
+        let onecrl = AuthenticatedOneCrl::from_saved(
+            onecrl.response,
+            onecrl.certificate_chain,
+            onecrl_trust,
+            fetched_at,
+        )?;
+        let state = index_pair(&onecrl.snapshot, &crlset, fetched_at)?;
         let envelope = CacheEnvelope {
             version: CACHE_VERSION,
             fetched_at,
-            onecrl,
+            onecrl_response: STANDARD.encode(&onecrl.response),
+            onecrl_certificate_chain: STANDARD.encode(&onecrl.certificate_chain),
             crlset_crx: STANDARD.encode(signed_crx),
         };
         write_cache(&directory, &envelope)?;
@@ -591,13 +664,20 @@ async fn refresh_loop(
     interval: Duration,
     mut delay: Duration,
     publisher_key_hash: [u8; 32],
+    onecrl_trust: OneCrlTrust,
 ) {
     loop {
         tokio::time::sleep(delay).await;
         if live.strong_count() == 0 {
             return;
         }
-        let refreshed = fetch_and_persist(source.as_ref(), &cache_dir, publisher_key_hash).await;
+        let refreshed = fetch_and_persist(
+            source.as_ref(),
+            &cache_dir,
+            publisher_key_hash,
+            onecrl_trust,
+        )
+        .await;
         let Some(handle) = live.upgrade() else {
             return;
         };

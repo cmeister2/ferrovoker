@@ -7,7 +7,7 @@ for the main async Reqwest integration.
 
 ```toml
 [dependencies]
-ferrovoker = { version = "1", features = ["rustls"] }
+ferrovoker = { version = "2", features = ["rustls"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -51,9 +51,10 @@ hours, and snapshots older than 24 hours reject checks. CRLSet's `NotAfter`
 can expire earlier. Invalid or stale cache data is replaced by a complete
 successful two-feed fetch. The cache is written atomically.
 
-Cached CRLSets retain their signed CRX3 container, and its signature and pinned
-publisher key are checked again when the cache is loaded. Older unsigned cache
-entries are ignored and downloaded again.
+The cache retains the original signed CRX3 container for CRLSet and the original
+OneCRL response with its selected certificate chain. Both publisher signatures
+and pinned production identities are checked again when the cache is loaded.
+Older cache entries without this evidence are ignored and downloaded again.
 
 Successful background refreshes replace the shared index for subsequent checks
 and TLS handshakes. Failed refreshes retain the prior snapshot and are exposed by
@@ -78,12 +79,16 @@ I/O enabled. Initialization fails if no fresh complete pair can be obtained.
 
 ## Features and lower-level APIs
 
-`AsyncDownloader` and `RevocationSet::from_snapshots` remain available for custom
-clients and applications managing their own persistence.
-`Downloader` provides a blocking alternative. Fixed snapshots require your own
-refresh policy. `Revocations::snapshot()` returns a fixed index without the
-managed maximum-age checks. Custom clients must set timeouts,
-transport policy, and an application/version User-Agent.
+`AsyncDownloader` and `Downloader` provide lower-level authenticated downloads;
+the latter is blocking. They verify OneCRL and CRLSet publisher signatures at
+download time, but their public API does not expose a complete proof artifact or
+a way to reauthenticate persisted return values. Callers persisting those values
+must provide their own storage integrity and refresh policy. `OneCrl::from_slice`, `CrlSet::from_bytes`, and
+`RevocationSet::from_snapshots` parse or index offline input without authenticating
+it. `Revocations::snapshot()` returns a fixed index without the managed maximum-age
+checks. Custom HTTP clients must set timeouts, transport policy, and an
+application/version User-Agent for feed and component requests; OneCRL signing
+chains use the library's isolated client.
 
 | Feature | Purpose |
 | --- | --- |
@@ -142,7 +147,11 @@ cargo run --features cli -- crlset --output crl-set
 Omit `--output` to write the artifact to standard output. Progress and errors go
 to standard error. Each HTTP request has a 60-second timeout; downloaded and
 extracted payloads are limited to 64 MiB. Override them with `--timeout SECONDS`
-and `--max-bytes BYTES`.
+and `--max-bytes BYTES`. OneCRL signing chains always retain a 1 MiB ceiling.
+
+The OneCRL command verifies Mozilla's content signature, production signing root,
+and OneCRL leaf identity before writing JSON. The resulting file is a plain
+snapshot; loading it through `OneCrl::from_slice` does not repeat authentication.
 
 The CRLSet command authenticates the signed CRX3, then writes the unpacked
 `crl-set` payload. This output no longer carries its publisher signature; retain

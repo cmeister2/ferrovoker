@@ -15,7 +15,7 @@ use ferrovoker::Downloader;
 #[command(
     version,
     about,
-    long_about = "Download Mozilla OneCRL and Chrome CRLSets. Chrome CRX3 signatures are verified against the pinned CRLSet publisher key. Mozilla OneCRL content signatures are not verified. Downloads do not perform certificate validation."
+    long_about = "Download Mozilla OneCRL and Chrome CRLSets. Publisher signatures are verified against pinned production identities. Downloads do not validate application certificate chains."
 )]
 struct Arguments {
     /// Maximum downloaded or extracted size in bytes.
@@ -72,7 +72,9 @@ fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(arguments.timeout))
         .build()?;
-    let downloader = Downloader::with_client(client).with_max_bytes(arguments.max_bytes);
+    let downloader =
+        Downloader::with_client_and_chain_timeout(client, Duration::from_secs(arguments.timeout))?
+            .with_max_bytes(arguments.max_bytes);
     let (bytes, output) = match arguments.command {
         Command::Onecrl { output } => {
             let snapshot = downloader.fetch_onecrl()?;

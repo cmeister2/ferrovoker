@@ -13,13 +13,13 @@ use super::*;
 /// Deterministic response to one complete-pair loading attempt.
 enum Outcome {
     /// A successful complete pair of feed snapshots.
-    Feeds(OneCrl, CrlSet),
+    Feeds(AuthenticatedOneCrl, CrlSet),
     /// A failure that must not replace the current snapshot.
     Failure,
     /// A failure held until the test has inspected the preceding successful state.
     GatedFailure(Arc<Notify>),
     /// A complete pair held until the test has inspected failure retention.
-    GatedFeeds(Arc<Notify>, OneCrl, CrlSet),
+    GatedFeeds(Arc<Notify>, AuthenticatedOneCrl, CrlSet),
     /// An in-flight request that remains pending until its task is aborted.
     Pending,
 }
@@ -123,12 +123,8 @@ fn parse_crx(bytes: Vec<u8>) -> CrlSet {
 /// # Panics
 ///
 /// Panics if a supplied generated certificate cannot be parsed.
-fn feeds(sequence: u64, blocked: Option<&[u8]>) -> (OneCrl, CrlSet) {
-    let onecrl = OneCrl {
-        timestamp: sequence,
-        metadata: json!({}),
-        changes: vec![],
-    };
+fn feeds(sequence: u64, blocked: Option<&[u8]>) -> (AuthenticatedOneCrl, CrlSet) {
+    let onecrl = crate::onecrl_signature::test_support::authenticated_snapshot(sequence, vec![]);
     let extra = blocked.map_or_else(
         || json!({}),
         |der| {
@@ -150,15 +146,34 @@ fn envelope(sequence: u64, fetched_at: u64) -> CacheEnvelope {
     CacheEnvelope {
         version: CACHE_VERSION,
         fetched_at,
-        onecrl,
+        onecrl_response: STANDARD.encode(onecrl.response),
+        onecrl_certificate_chain: STANDARD.encode(onecrl.certificate_chain),
         crlset_crx: STANDARD.encode(crlset.signed_crx.expect("signed test CRLSet")),
     }
+}
+
+/// Return the stable runtime-generated Mozilla trust policy used by cache fixtures.
+fn onecrl_trust() -> OneCrlTrust {
+    crate::onecrl_signature::test_support::signed_snapshot(0, vec![]).trust
+}
+
+/// Parse the authenticated OneCRL response retained by one test cache envelope.
+///
+/// # Panics
+///
+/// Panics if a test envelope does not contain valid response base64 or OneCRL JSON.
+fn cached_onecrl(envelope: &CacheEnvelope) -> OneCrl {
+    let response = STANDARD
+        .decode(&envelope.onecrl_response)
+        .expect("OneCRL response base64");
+    OneCrl::from_slice(&response).expect("cached OneCRL response")
 }
 
 /// Use an isolated temporary cache directory and a slow background interval.
 fn config(directory: &Path) -> CacheConfig {
     CacheConfig {
         publisher_key_hash: crate::crx::test_support::publisher_key_hash(),
+        onecrl_trust: onecrl_trust(),
         ..CacheConfig::default()
     }
     .with_cache_dir(directory.to_path_buf())
@@ -257,7 +272,7 @@ async fn legacy_unsigned_cache_is_ignored_and_replacement_must_succeed() {
         let legacy_bytes = serde_json::to_vec(&json!({
             "version": 1,
             "fetched_at": now(),
-            "onecrl": legacy_onecrl,
+            "onecrl": legacy_onecrl.snapshot,
             "crlset": STANDARD.encode(legacy_crlset.bytes),
             "authenticated": true,
         }))
@@ -320,6 +335,7 @@ async fn unauthenticated_cache_never_supplies_managed_state() {
                     &path,
                     Duration::from_secs(300),
                     &crate::crx::test_support::publisher_key_hash(),
+                    onecrl_trust(),
                 )
                 .is_err()
             );
@@ -339,13 +355,81 @@ async fn unauthenticated_cache_never_supplies_managed_state() {
                 let saved: CacheEnvelope =
                     serde_json::from_slice(&std::fs::read(path).expect("replacement cache"))
                         .expect("complete replacement");
-                assert_eq!(saved.onecrl.timestamp, 2);
+                assert_eq!(cached_onecrl(&saved).timestamp, 2);
                 assert_eq!(
                     parse_crx(STANDARD.decode(saved.crlset_crx).expect("replacement CRX"))
                         .header
                         .sequence,
                     2,
                 );
+            }
+        }
+    }
+}
+
+/// OneCRL cache bytes and certificate evidence are reverified instead of trusting claims.
+#[tokio::test]
+async fn tampered_onecrl_cache_never_supplies_managed_state() {
+    for case in 0..3 {
+        for replacement_succeeds in [false, true] {
+            let directory = tempfile::tempdir().expect("cache directory");
+            let mut cached = envelope(1, now());
+            match case {
+                0 => {
+                    let response = STANDARD
+                        .decode(&cached.onecrl_response)
+                        .expect("OneCRL response");
+                    let mut response: Value =
+                        serde_json::from_slice(&response).expect("OneCRL JSON");
+                    response["timestamp"] = json!(2);
+                    cached.onecrl_response = STANDARD
+                        .encode(serde_json::to_vec(&response).expect("tampered OneCRL response"));
+                }
+                1 => {
+                    let mut chain = STANDARD
+                        .decode(&cached.onecrl_certificate_chain)
+                        .expect("certificate chain");
+                    chain[0] ^= 1;
+                    cached.onecrl_certificate_chain = STANDARD.encode(chain);
+                }
+                2 => cached.onecrl_response = "bad!".into(),
+                _ => unreachable!("bounded OneCRL cache case"),
+            }
+            let mut forged_cache = serde_json::to_value(&cached).expect("cache JSON");
+            forged_cache["authenticated"] = json!(true);
+            forged_cache["mozilla_verified"] = json!(true);
+            let path = directory.path().join(CACHE_FILENAME);
+            std::fs::write(
+                &path,
+                serde_json::to_vec(&forged_cache).expect("forged cache"),
+            )
+            .expect("invalid fixture");
+            assert!(
+                read_cache(
+                    &path,
+                    Duration::from_secs(300),
+                    &crate::crx::test_support::publisher_key_hash(),
+                    onecrl_trust(),
+                )
+                .is_err()
+            );
+            let outcome = if replacement_succeeds {
+                let (onecrl, crlset) = feeds(3, None);
+                Outcome::Feeds(onecrl, crlset)
+            } else {
+                Outcome::Failure
+            };
+            let source = MockLoader::new(vec![outcome]);
+            let result = config(directory.path())
+                .load_with_source(source.clone())
+                .await;
+            assert_eq!(source.calls.load(Ordering::SeqCst), 1, "cache case {case}");
+            assert_eq!(result.is_ok(), replacement_succeeds, "cache case {case}");
+            if replacement_succeeds {
+                let saved: CacheEnvelope =
+                    serde_json::from_slice(&std::fs::read(path).expect("replacement cache"))
+                        .expect("complete replacement");
+                assert_eq!(cached_onecrl(&saved).timestamp, 3);
             }
         }
     }
@@ -361,6 +445,10 @@ async fn default_policy_rejects_an_unrelated_publisher() {
         config.publisher_key_hash,
         crate::crx::CRLSET_PUBLISHER_KEY_HASH
     );
+    assert_eq!(
+        config.onecrl_trust.root_sha256,
+        PRODUCTION_TRUST.root_sha256
+    );
     assert_ne!(
         config.publisher_key_hash,
         crate::crx::test_support::publisher_key_hash()
@@ -370,6 +458,7 @@ async fn default_policy_rejects_an_unrelated_publisher() {
             &directory.path().join(CACHE_FILENAME),
             config.max_age,
             &config.publisher_key_hash,
+            config.onecrl_trust,
         )
         .is_err()
     );
@@ -382,7 +471,9 @@ async fn default_policy_rejects_an_unrelated_publisher() {
 #[tokio::test]
 async fn publication_uses_signed_payload_and_rejects_unsigned_snapshots() {
     let directory = tempfile::tempdir().expect("cache directory");
-    let (onecrl, mut downloaded) = feeds(7, None);
+    let (mut onecrl, mut downloaded) = feeds(7, None);
+    onecrl.snapshot.timestamp = 999;
+    onecrl.snapshot.changes.clear();
     let authentic_crx = downloaded.signed_crx.clone().expect("signed fixture");
     downloaded.bytes.clear();
     downloaded.header.sequence = 999;
@@ -396,10 +487,11 @@ async fn publication_uses_signed_payload_and_rejects_unsigned_snapshots() {
     )
     .expect("published envelope");
     assert_eq!(
-        STANDARD.decode(saved.crlset_crx).expect("original CRX"),
+        STANDARD.decode(&saved.crlset_crx).expect("original CRX"),
         authentic_crx
     );
     assert_eq!(parse_crx(authentic_crx).header.sequence, 7);
+    assert_eq!(cached_onecrl(&saved).timestamp, 7);
     drop(live);
 
     let unsigned_directory = tempfile::tempdir().expect("unsigned cache directory");
@@ -413,12 +505,25 @@ async fn publication_uses_signed_payload_and_rejects_unsigned_snapshots() {
             .is_err()
     );
     assert!(!unsigned_directory.path().join(CACHE_FILENAME).exists());
+
+    let unsigned_directory = tempfile::tempdir().expect("unsigned OneCRL cache directory");
+    let (mut onecrl, crlset) = feeds(9, None);
+    onecrl.response = br#"{"metadata":{},"timestamp":9,"changes":[]}"#.to_vec();
+    onecrl.certificate_chain.clear();
+    let source = MockLoader::new(vec![Outcome::Feeds(onecrl, crlset)]);
+    assert!(
+        config(unsigned_directory.path())
+            .load_with_source(source)
+            .await
+            .is_err()
+    );
+    assert!(!unsigned_directory.path().join(CACHE_FILENAME).exists());
 }
 
 /// Missing, corrupt, stale, future, unsupported, and expired caches refresh completely.
 #[tokio::test]
 async fn invalid_caches_are_replaced_with_complete_pairs() {
-    for case in 0..9 {
+    for case in 0..12 {
         let directory = tempfile::tempdir().expect("cache directory");
         let path = directory.path().join(CACHE_FILENAME);
         let mut cached = envelope(1, now());
@@ -457,6 +562,24 @@ async fn invalid_caches_are_replaced_with_complete_pairs() {
                 cached.version = 1;
                 write_cache(directory.path(), &cached).expect("legacy version fixture");
             }
+            9 => {
+                cached.onecrl_response = "bad!".into();
+                write_cache(directory.path(), &cached).expect("bad OneCRL base64 fixture");
+            }
+            10 => {
+                cached.onecrl_certificate_chain = "bad!".into();
+                write_cache(directory.path(), &cached).expect("bad chain base64 fixture");
+            }
+            11 => {
+                let response = STANDARD
+                    .decode(&cached.onecrl_response)
+                    .expect("OneCRL response");
+                let mut response: Value = serde_json::from_slice(&response).expect("OneCRL JSON");
+                response["timestamp"] = json!(99);
+                cached.onecrl_response = STANDARD
+                    .encode(serde_json::to_vec(&response).expect("tampered OneCRL response"));
+                write_cache(directory.path(), &cached).expect("tampered OneCRL fixture");
+            }
             _ => unreachable!("bounded test case"),
         }
         let (onecrl, crlset) = feeds(2, None);
@@ -470,7 +593,7 @@ async fn invalid_caches_are_replaced_with_complete_pairs() {
             serde_json::from_slice(&std::fs::read(&path).expect("saved pair"))
                 .expect("saved envelope");
         assert_eq!(saved.version, CACHE_VERSION);
-        assert_eq!(saved.onecrl.timestamp, 2);
+        assert_eq!(cached_onecrl(&saved).timestamp, 2);
         assert_eq!(
             parse_crx(STANDARD.decode(saved.crlset_crx).expect("saved base64"))
                 .header
@@ -513,8 +636,8 @@ fn atomic_cache_replacements_keep_complete_pairs() {
             let saved: CacheEnvelope =
                 serde_json::from_slice(&std::fs::read(&path).expect("read atomic file"))
                     .expect("complete JSON");
-            let crlset = parse_crx(STANDARD.decode(saved.crlset_crx).expect("base64"));
-            assert_eq!(saved.onecrl.timestamp, crlset.header.sequence);
+            let crlset = parse_crx(STANDARD.decode(&saved.crlset_crx).expect("base64"));
+            assert_eq!(cached_onecrl(&saved).timestamp, crlset.header.sequence);
         }
     });
     for sequence in 1..20 {
@@ -532,6 +655,7 @@ fn atomic_cache_replacements_keep_complete_pairs() {
             &directory.path().join(CACHE_FILENAME),
             Duration::from_secs(60),
             &crate::crx::test_support::publisher_key_hash(),
+            onecrl_trust(),
         )
         .is_ok()
     );
@@ -667,6 +791,7 @@ async fn background_refresh_updates_and_retains_last_good_snapshot_after_failure
         &directory.path().join(CACHE_FILENAME),
         Duration::from_secs(300),
         &crate::crx::test_support::publisher_key_hash(),
+        onecrl_trust(),
     )
     .expect("refreshed cache");
     assert_eq!(

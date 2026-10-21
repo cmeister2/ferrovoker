@@ -167,8 +167,9 @@ unsafe fn initialize_handle(out: *mut *mut Ferrovoker) -> Result<(), String> {
 /// network I/O, and fail when that snapshot becomes too old. Returns 0 on success,
 /// or -1 on invalid arguments, cache, download, integrity, or parsing errors.
 /// Errors leave `*out` null. Chrome CRX3 signatures are verified against the
-/// pinned CRLSet publisher key, including when loading cached data. Mozilla
-/// OneCRL content signatures are not verified.
+/// pinned CRLSet publisher key. Mozilla OneCRL content signatures are verified
+/// against the pinned production signing root and OneCRL leaf identity. Both
+/// checks are repeated when loading cached data.
 ///
 /// # Safety
 ///

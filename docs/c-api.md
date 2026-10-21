@@ -19,7 +19,8 @@ keeps its own runtime for caching and background refresh until the handle is fre
 `ferrovoker_free` releases the handle. C callers only supply certificates;
 feed downloads, formats, caching, and refresh remain inside the library. The
 initial load blocks. Chrome's signed CRX3 container is verified, including when
-loading the cache. Mozilla OneCRL content signatures remain unverified.
+loading the cache. Mozilla's OneCRL content signature, pinned production signing
+root, and OneCRL leaf identity are also verified on downloads and cache loads.
 The constructor returns `0` on success or `-1` on error.
 
 The C API returns `NOT_LISTED`, `REVOKED`, or `ERROR`, with thread-local diagnostic

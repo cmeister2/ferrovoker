@@ -5,9 +5,9 @@ pub type ExampleError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Build a TLS configuration backed by cached, automatically refreshed feeds.
 ///
-/// Chrome CRX3 signatures are verified against the pinned CRLSet publisher key,
-/// including when loading cached data. Mozilla OneCRL is fetched over HTTPS,
-/// but its content signatures are not verified.
+/// Chrome CRX3 signatures and Mozilla OneCRL content signatures are verified
+/// against their pinned production publisher identities, including when loading
+/// cached data.
 ///
 /// # Errors
 ///

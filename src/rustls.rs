@@ -8,10 +8,10 @@
 //!
 //! These feeds are partial blocklists: a certificate absent from them still
 //! requires normal TLS verification. Managed downloads authenticate Chrome's
-//! CRX3 container against the pinned CRLSet publisher key. Mozilla OneCRL content
-//! signatures are not verified. Managed providers enforce their configured
-//! refresh and cache-age policy; callers using fixed snapshots must arrange
-//! authentication and freshness.
+//! CRX3 container and Mozilla's signed OneCRL changeset against pinned production
+//! publisher identities. Managed providers enforce their configured refresh and
+//! cache-age policy; callers using fixed snapshots must arrange authentication
+//! and freshness.
 
 use std::sync::Arc;
 

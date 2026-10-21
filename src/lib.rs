@@ -4,10 +4,10 @@
 //! feeds, caches them in the OS cache directory, and keeps a combined index
 //! refreshed in the background for as long as its handle is retained.
 //!
-//! Chrome downloads and cached CRX containers are authenticated against the
-//! pinned CRLSet signing key. Mozilla content signatures remain unverified.
-//! Feed entries are matched using [`RevocationSet`]. Feed transport, integrity,
-//! authenticity, freshness, and certificate validation are distinct concerns.
+//! Downloads and cached data are authenticated against the pinned Chrome
+//! CRLSet signing key and Mozilla OneCRL content-signing root. Feed entries are
+//! matched using [`RevocationSet`]. Feed transport, integrity, authenticity,
+//! freshness, and certificate validation are distinct concerns.
 //! The `rustls` feature adds a verifier that applies these checks after normal
 //! chain and hostname verification. The `ffi` feature exports the C interface.
 //!
@@ -20,7 +20,8 @@
 //! ```
 //!
 //! Lower-level parsing is also available for applications managing their own
-//! authenticated snapshots:
+//! snapshot authentication and refresh policy. Parsing alone does not verify a
+//! publisher signature:
 //!
 //! ```no_run
 //! use ferrovoker::{OneCrl, RevocationSet};
@@ -41,6 +42,8 @@ mod cache;
 mod crx;
 #[cfg(feature = "download")]
 mod download;
+#[cfg(feature = "download")]
+mod onecrl_signature;
 mod revocation;
 
 #[cfg(feature = "rustls")]
@@ -119,6 +122,7 @@ impl RevocationProvider for RevocationSet {
 
 /// A download, integrity, or feed-format failure.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// An HTTP request or status code failed.
     #[cfg(feature = "download")]
@@ -141,7 +145,7 @@ pub enum Error {
     /// A required feed field, framing value, or URL is invalid.
     #[error("invalid feed format: {0}")]
     InvalidFormat(&'static str),
-    /// A response or extracted payload exceeds the configured byte limit.
+    /// A response or extracted payload exceeds a configured or built-in byte limit.
     #[error("download or extracted payload exceeds {0} bytes")]
     SizeLimit(u64),
     /// The downloaded component does not match the advertised SHA-256.
@@ -155,6 +159,14 @@ pub enum Error {
     #[cfg(feature = "download")]
     #[error("CRX3 is not signed by the pinned CRLSet publisher")]
     UntrustedCrxPublisher,
+    /// A Mozilla OneCRL content signature is missing, malformed, or invalid.
+    #[cfg(feature = "download")]
+    #[error("invalid Mozilla OneCRL content signature")]
+    InvalidOneCrlSignature,
+    /// A OneCRL signing chain fails Mozilla's pinned publisher policy.
+    #[cfg(feature = "download")]
+    #[error("OneCRL is not signed by Mozilla's trusted content-signing identity")]
+    UntrustedOneCrlPublisher,
     /// Mozilla has requested that this downloader delay further requests.
     #[error("Remote Settings requested backoff; retry after {0} seconds")]
     Backoff(u64),
@@ -194,6 +206,9 @@ impl OneCrl {
     /// Unknown record fields are retained. Tombstones and unsupported identifier
     /// combinations are rejected because this API represents complete snapshots.
     /// Identifier strings remain opaque; their base64 and DER are not validated.
+    /// This operation does not verify Mozilla's content signature or fetch the
+    /// certificate chain named by its metadata; use a downloader for authenticated
+    /// input.
     ///
     /// # Errors
     ///
