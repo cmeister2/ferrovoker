@@ -50,10 +50,62 @@ OneCRL parser does not fetch or validate the certificate chain named by `x5u`.
 
 ## Publisher authentication and freshness
 
-Signed anti-rollback protection is not implemented for either feed; local cache
-timestamps enforce refresh and maximum-age policy, rather than cryptographic
-freshness. Both feeds have partial coverage; their absence never establishes
-that a certificate is valid.
+Managed feeds reject backwards movement of either Mozilla's authenticated
+collection timestamp or Google's authenticated CRLSet sequence. Comparisons use
+values reconstructed from verified signed containers, never mutable public
+snapshot fields. Equal versions are allowed: publishers need not advance on
+every refresh. Neither field proves that a response is the newest available.
+First use is trust on first authenticated observation; replay of an equal
+version can keep renewing the local fetch time. Maximum age still measures time
+since a successful complete fetch, not publisher age. Publisher version resets
+fail closed and require operator investigation.
+
+Both feeds have partial coverage; their absence never establishes that a
+certificate is valid.
+
+### Persistent rollback checkpoints
+
+The managed cache directory contains `versions-v1.json`, a small local
+high-water mark for both feeds, and a stable `snapshots.lock` advisory lock file.
+All cooperating processes sharing that directory serialize their read/compare/
+commit transactions using this lock. The filesystem must support advisory locks
+and atomic same-directory replacement. Downloads happen outside the lock;
+comparison happens after authentication, immediately before persistence.
+A failed download or backwards version leaves both committed files unchanged.
+Successful commits atomically replace and sync the checkpoint **before**
+atomically replacing the complete two-feed envelope; the live snapshot is
+published only after persistence succeeds. On Unix the directory is synced
+after each rename. Durability on other platforms depends on filesystem rename
+and flush guarantees.
+
+An interruption between these writes can leave a checkpoint ahead of the
+envelope. Startup rejects that older envelope and requires a complete download
+at least as new as both checkpoint values. It never combines feeds from separate
+attempts. A failed envelope write can conservatively advance the floor without
+publishing a snapshot; recovery follows the same rule. Uncommitted temporary
+files are ignored. Missing, stale, or corrupt feed envelopes do not erase the
+checkpoint. A malformed/unreadable checkpoint fails initialization and refresh
+closed rather than silently resetting history.
+
+An absent checkpoint is bootstrapped from a usable authenticated v3 cache
+(including a stale cache whose signatures and other validity requirements still
+pass), or from the first successfully authenticated complete download. Legacy,
+corrupt, or no-longer-verifiable caches cannot establish this initial floor.
+
+This protects against ordinary network replay of **lower** versions after an
+observation has been durably recorded, assuming trustworthy local storage,
+cooperating writers, and the existing publisher/signature and wall-clock trust.
+It does not provide cryptographic freshness or tamper-resistant storage.
+An attacker able to replace/delete the checkpoint, restore the directory from
+an old backup, change the clock, or use another cache directory can reset or
+roll back this history. Automatic cache eviction also loses these observations.
+Choose a persistent application-owned directory when retaining history matters.
+Cache signatures authenticate feed bytes, not the local
+checkpoint or fetch timestamp. Back up and restore the entire directory
+consistently; do not routinely clear the checkpoint as disposable cache data.
+If it is corrupt, restore trusted state or explicitly reset it after investigating,
+accepting that a reset loses previous observations. Offline parsers and fixed
+`RevocationSet` instances do not use these managed checkpoints.
 
 Cached OneCRL responses and certificate chains, as well as cached CRX
 containers, are reverified on every load. Invalid signatures, expired or

@@ -824,3 +824,272 @@ async fn dropping_last_handle_aborts_pending_refresh_without_reference_cycle() {
     assert!(weak_live.upgrade().is_none());
     wait_until(|| weak_source.upgrade().is_none()).await;
 }
+
+/// Exercise each publisher independently using authentic signed containers.
+#[tokio::test]
+async fn rollback_equal_and_advance_are_transactional() {
+    for (mozilla, chrome, accepted) in [
+        (9, 11, false),
+        (11, 9, false),
+        (10, 10, true),
+        (11, 12, true),
+    ] {
+        let directory = tempfile::tempdir().expect("directory");
+        let (onecrl, crlset) = feeds(10, None);
+        let source = MockLoader::new(vec![Outcome::Feeds(onecrl, crlset)]);
+        fetch_and_persist(
+            source.as_ref(),
+            directory.path(),
+            crate::crx::test_support::publisher_key_hash(),
+            onecrl_trust(),
+        )
+        .await
+        .expect("initial");
+        let before = std::fs::read(directory.path().join(CACHE_FILENAME)).expect("cache");
+        let checkpoint =
+            std::fs::read(directory.path().join("versions-v1.json")).expect("checkpoint");
+        let onecrl = feeds(mozilla, None).0;
+        let source = MockLoader::new(vec![Outcome::Feeds(
+            onecrl,
+            self::crlset(chrome, json!({})),
+        )]);
+        let result = fetch_and_persist(
+            source.as_ref(),
+            directory.path(),
+            crate::crx::test_support::publisher_key_hash(),
+            onecrl_trust(),
+        )
+        .await;
+        assert_eq!(result.is_ok(), accepted);
+        if !accepted {
+            assert_eq!(
+                std::fs::read(directory.path().join(CACHE_FILENAME)).expect("cache"),
+                before
+            );
+            assert_eq!(
+                std::fs::read(directory.path().join("versions-v1.json")).expect("checkpoint"),
+                checkpoint
+            );
+        }
+    }
+}
+
+/// A durable floor survives stale, corrupted, missing, and interrupted cache replacement.
+#[tokio::test]
+async fn startup_preserves_checkpoint_when_envelope_is_unusable() {
+    for case in 0..4 {
+        let directory = tempfile::tempdir().expect("directory");
+        write_checkpoint(
+            directory.path(),
+            Versions {
+                onecrl: 10,
+                crlset: 10,
+            },
+        )
+        .expect("floor");
+        match case {
+            0 => write_cache(directory.path(), &envelope(10, now().saturating_sub(301)))
+                .expect("stale"),
+            1 => std::fs::write(directory.path().join(CACHE_FILENAME), b"{").expect("corrupt"),
+            2 => {} // Crash after checkpoint commit and before envelope rename.
+            3 => write_cache(directory.path(), &envelope(9, now())).expect("old envelope"),
+            _ => unreachable!(),
+        }
+        // An abandoned temporary write is never considered committed state.
+        std::fs::write(directory.path().join(".interrupted"), b"partial").expect("temporary");
+        let (onecrl, crlset) = feeds(9, None);
+        assert!(
+            config(directory.path())
+                .load_with_source(MockLoader::new(vec![Outcome::Feeds(onecrl, crlset)]))
+                .await
+                .is_err()
+        );
+        let (onecrl, crlset) = feeds(10, None);
+        let live = config(directory.path())
+            .load_with_source(MockLoader::new(vec![Outcome::Feeds(onecrl, crlset)]))
+            .await
+            .expect("equal recovery");
+        assert_eq!(live.current.load().versions.onecrl, 10);
+    }
+}
+
+/// Corrupt ordering state is not silently discarded even when the cache is fresh.
+#[tokio::test]
+async fn corrupt_checkpoint_fails_closed() {
+    let directory = tempfile::tempdir().expect("directory");
+    write_cache(directory.path(), &envelope(10, now())).expect("cache");
+    std::fs::write(directory.path().join("versions-v1.json"), b"{").expect("corrupt floor");
+    let (onecrl, crlset) = feeds(11, None);
+    assert!(
+        config(directory.path())
+            .load_with_source(MockLoader::new(vec![Outcome::Feeds(onecrl, crlset)]))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        std::fs::read(directory.path().join("versions-v1.json")).expect("floor"),
+        b"{"
+    );
+}
+
+/// A delayed older download cannot overwrite a concurrently committed newer pair.
+#[tokio::test]
+async fn concurrent_downloads_compare_at_commit_time() {
+    let directory = tempfile::tempdir().expect("directory");
+    let gate = Arc::new(Notify::new());
+    let (onecrl, crlset) = feeds(10, None);
+    let slow = MockLoader::new(vec![Outcome::GatedFeeds(gate.clone(), onecrl, crlset)]);
+    let path = directory.path().to_path_buf();
+    let slow_clone = slow.clone();
+    let pending = tokio::spawn(async move {
+        fetch_and_persist(
+            slow_clone.as_ref(),
+            &path,
+            crate::crx::test_support::publisher_key_hash(),
+            onecrl_trust(),
+        )
+        .await
+    });
+    wait_until(|| slow.calls.load(Ordering::SeqCst) == 1).await;
+    let (onecrl, crlset) = feeds(11, None);
+    let fast = MockLoader::new(vec![Outcome::Feeds(onecrl, crlset)]);
+    fetch_and_persist(
+        fast.as_ref(),
+        directory.path(),
+        crate::crx::test_support::publisher_key_hash(),
+        onecrl_trust(),
+    )
+    .await
+    .expect("newer wins");
+    gate.notify_one();
+    assert!(pending.await.expect("slow task").is_err());
+    let saved = read_cache(
+        &directory.path().join(CACHE_FILENAME),
+        Duration::from_secs(300),
+        &crate::crx::test_support::publisher_key_hash(),
+        onecrl_trust(),
+    )
+    .expect("cache");
+    assert_eq!(saved.versions.onecrl, 11);
+    assert_eq!(saved.versions.crlset, 11);
+}
+
+/// A stale existing v3 envelope supplies a migration floor before the first checkpoint.
+#[tokio::test]
+async fn migration_retains_authenticated_stale_versions() {
+    let directory = tempfile::tempdir().expect("directory");
+    write_cache(directory.path(), &envelope(10, now().saturating_sub(301))).expect("stale cache");
+    let (onecrl, crlset) = feeds(9, None);
+    assert!(
+        config(directory.path())
+            .load_with_source(MockLoader::new(vec![Outcome::Feeds(onecrl, crlset)]))
+            .await
+            .is_err()
+    );
+}
+
+/// A failed envelope rename preserves the durable floor for the next startup.
+#[tokio::test]
+async fn failed_envelope_write_keeps_conservative_floor() {
+    let directory = tempfile::tempdir().expect("directory");
+    std::fs::create_dir(directory.path().join(CACHE_FILENAME)).expect("block rename");
+    let (onecrl, crlset) = feeds(12, None);
+    let source = MockLoader::new(vec![Outcome::Feeds(onecrl, crlset)]);
+    assert!(
+        fetch_and_persist(
+            source.as_ref(),
+            directory.path(),
+            crate::crx::test_support::publisher_key_hash(),
+            onecrl_trust()
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        read_checkpoint(directory.path())
+            .expect("floor")
+            .expect("committed")
+            .onecrl,
+        12
+    );
+    std::fs::remove_dir(directory.path().join(CACHE_FILENAME)).expect("unblock rename");
+    let (onecrl, crlset) = feeds(11, None);
+    assert!(
+        config(directory.path())
+            .load_with_source(MockLoader::new(vec![Outcome::Feeds(onecrl, crlset)]))
+            .await
+            .is_err()
+    );
+    let (onecrl, crlset) = feeds(12, None);
+    assert!(
+        config(directory.path())
+            .load_with_source(MockLoader::new(vec![Outcome::Feeds(onecrl, crlset)]))
+            .await
+            .is_ok()
+    );
+}
+
+/// Replayed signed feeds report failure without renewing the live age deadline.
+#[tokio::test]
+async fn background_rollback_preserves_live_state_and_age() {
+    let directory = tempfile::tempdir().expect("directory");
+    let fetched_at = now().saturating_sub(1);
+    write_cache(directory.path(), &envelope(10, fetched_at)).expect("due cache");
+    let (onecrl, crlset) = feeds(9, None);
+    let source = MockLoader::new(vec![Outcome::Feeds(onecrl, crlset), Outcome::Pending]);
+    let live = config(directory.path())
+        .with_refresh_interval(Duration::from_millis(40))
+        .load_with_source(source)
+        .await
+        .expect("cache");
+    let original = live.snapshot();
+    wait_until(|| live.last_refresh_error().is_some()).await;
+    assert!(
+        live.last_refresh_error()
+            .expect("error")
+            .contains("rollback")
+    );
+    assert!(Arc::ptr_eq(&original, &live.snapshot()));
+    assert_eq!(live.last_updated_unix(), fetched_at);
+}
+
+/// Separate blocking workers must not both commit against the same obsolete floor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn simultaneous_commits_keep_the_maximum_version() {
+    let directory = tempfile::tempdir().expect("directory");
+    let mut tasks = Vec::new();
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    for version in [20, 21] {
+        let directory = directory.path().to_path_buf();
+        let barrier = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            let (onecrl, crlset) = feeds(version, None);
+            let source = MockLoader::new(vec![Outcome::Feeds(onecrl, crlset)]);
+            barrier.wait().await;
+            fetch_and_persist(
+                source.as_ref(),
+                &directory,
+                crate::crx::test_support::publisher_key_hash(),
+                onecrl_trust(),
+            )
+            .await
+        }));
+    }
+    for task in tasks {
+        let _ = task.await.expect("worker");
+    }
+    let checkpoint = read_checkpoint(directory.path())
+        .expect("floor")
+        .expect("committed");
+    assert_eq!(checkpoint.onecrl, 21);
+    assert_eq!(checkpoint.crlset, 21);
+    let state = read_cache(
+        &directory.path().join(CACHE_FILENAME),
+        Duration::from_secs(300),
+        &crate::crx::test_support::publisher_key_hash(),
+        onecrl_trust(),
+    )
+    .expect("pair");
+    assert_eq!(state.versions.onecrl, 21);
+    assert_eq!(state.versions.crlset, 21);
+}

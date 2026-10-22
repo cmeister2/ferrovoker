@@ -10,6 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use arc_swap::ArcSwap;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use directories::ProjectDirs;
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
 
@@ -135,6 +136,10 @@ impl CacheConfig {
     /// a complete download. Both feeds must succeed before an index is exposed.
     /// Cached Chrome CRX and Mozilla content signatures are reverified before
     /// use. Legacy caches without either feed's publisher evidence are ignored.
+    /// Authenticated publisher versions cannot decrease relative to the local
+    /// persistent checkpoint. Equal versions may refresh successfully. Corrupt
+    /// checkpoints fail closed; resetting local state loses rollback history.
+    /// This detects lower-version replay, not whether a feed is the newest.
     /// Disk reads, signature verification, and atomic writes run on Tokio's
     /// blocking worker pool.
     ///
@@ -197,7 +202,15 @@ impl CacheConfig {
         let onecrl_trust = self.onecrl_trust;
         let read_file = cache_file.clone();
         let cached = tokio::task::spawn_blocking(move || {
-            read_cache(&read_file, max_age, &publisher_key_hash, onecrl_trust)
+            let directory = read_file.parent().ok_or(Error::CacheUnavailable)?;
+            let _lock = lock_cache(directory)?;
+            let checkpoint = read_checkpoint(directory)?;
+            let state = read_cache(&read_file, max_age, &publisher_key_hash, onecrl_trust)?;
+            if let Some(checkpoint) = checkpoint {
+                state.versions.ensure_at_least(checkpoint)?;
+            }
+            write_checkpoint(directory, state.versions)?;
+            Ok::<_, Error>(state)
         })
         .await
         .map_err(|_| Error::InvalidFormat("cache read task failed"))?;
@@ -403,6 +416,8 @@ struct SnapshotState {
     set: Arc<RevocationSet>,
     /// Local Unix time after both feeds were fetched successfully.
     fetched_at: u64,
+    /// Authenticated publisher ordering values.
+    versions: Versions,
 }
 
 /// Single versioned file ensuring the two feed snapshots cannot be mixed by a crash.
@@ -418,6 +433,86 @@ struct CacheEnvelope {
     onecrl_certificate_chain: String,
     /// Base64-encoded original CRX, retaining publisher signatures for verification.
     crlset_crx: String,
+}
+
+/// Local high-water marks; these values are trusted persistent state, not signatures.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Versions {
+    /// Authenticated Mozilla collection timestamp.
+    onecrl: u64,
+    /// Authenticated Google sequence number.
+    crlset: u64,
+}
+
+impl Versions {
+    /// Reject either publisher moving backwards; equal versions allow refreshes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-format error for a rollback in either feed.
+    fn ensure_at_least(self, previous: Self) -> Result<()> {
+        if self.onecrl < previous.onecrl || self.crlset < previous.crlset {
+            return Err(Error::InvalidFormat(
+                "authenticated revocation feed rollback",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Serialize cache transactions across handles and processes using a stable lock inode.
+///
+/// # Errors
+///
+/// Returns directory, file-open, or advisory-lock errors.
+fn lock_cache(directory: &Path) -> Result<std::fs::File> {
+    std::fs::create_dir_all(directory)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(directory.join("snapshots.lock"))?;
+    FileExt::lock_exclusive(&file)?;
+    Ok(file)
+}
+
+/// Read bounded local ordering state, failing closed on corruption.
+///
+/// # Errors
+///
+/// Returns I/O or format errors; only an absent checkpoint permits bootstrapping.
+fn read_checkpoint(directory: &Path) -> Result<Option<Versions>> {
+    let file = match std::fs::File::open(directory.join("versions-v1.json")) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let mut bytes = Vec::new();
+    file.take(1025).read_to_end(&mut bytes)?;
+    if bytes.len() > 1024 {
+        return Err(Error::InvalidFormat("oversized revocation checkpoint"));
+    }
+    Ok(Some(serde_json::from_slice(&bytes)?))
+}
+
+/// Durably replace both ordering values together before replacing the feed envelope.
+///
+/// # Errors
+///
+/// Returns serialization, flush, sync, or atomic replacement errors.
+fn write_checkpoint(directory: &Path, versions: Versions) -> Result<()> {
+    let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
+    serde_json::to_writer(temporary.as_file_mut(), &versions)?;
+    temporary.as_file_mut().flush()?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(directory.join("versions-v1.json"))
+        .map_err(|error| error.error)?;
+    #[cfg(unix)]
+    std::fs::File::open(directory)?.sync_all()?;
+    Ok(())
 }
 
 /// Require a Tokio runtime before constructing clients or blocking worker tasks.
@@ -488,6 +583,10 @@ fn index_pair(onecrl: &OneCrl, crlset: &CrlSet, fetched_at: u64) -> Result<Arc<S
     Ok(Arc::new(SnapshotState {
         set: Arc::new(set),
         fetched_at,
+        versions: Versions {
+            onecrl: onecrl.timestamp,
+            crlset: crlset.header.sequence,
+        },
     }))
 }
 
@@ -649,6 +748,23 @@ async fn fetch_and_persist(
             onecrl_certificate_chain: STANDARD.encode(&onecrl.certificate_chain),
             crlset_crx: STANDARD.encode(signed_crx),
         };
+        let _lock = lock_cache(&directory)?;
+        if let Some(checkpoint) = read_checkpoint(&directory)? {
+            state.versions.ensure_at_least(checkpoint)?;
+        } else {
+            // Migration: a still-verifiable legacy envelope can establish a floor.
+            if let Ok(previous) = read_cache(
+                &directory.join(CACHE_FILENAME),
+                Duration::MAX,
+                &publisher_key_hash,
+                onecrl_trust,
+            ) {
+                state.versions.ensure_at_least(previous.versions)?;
+            }
+        }
+        // Commit the floor first. A crash may leave an older envelope, which must
+        // be downloaded again; it must never permit a lower version.
+        write_checkpoint(&directory, state.versions)?;
         write_cache(&directory, &envelope)?;
         Ok(state)
     })
